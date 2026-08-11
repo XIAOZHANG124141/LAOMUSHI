@@ -1,0 +1,444 @@
+task.spawn(function()
+    local DrRayLibrary = loadstring(game:HttpGet("https://raw.githubusercontent.com/AZYsGithub/DrRay-UI-Library/main/DrRay.lua"))()
+    local Window = DrRayLibrary:Load("Weapon Modifier Pro", "Default")
+
+    local MainTab = DrRayLibrary.newTab("Main Mods", "rbxassetid://4483362458")
+    local StatsTab = DrRayLibrary.newTab("Stats Customizer", "rbxassetid://4483362458")
+    local CombatTab = DrRayLibrary.newTab("Combat & Visuals", "rbxassetid://4483362458")
+
+    local WeaponSettings = {
+        Firerate    = 99999,  
+        BulletSpeed = 9999,  
+        Spread      = 0      
+    }
+
+    local HitboxSettings = {
+        EnemySize   = 50     
+    }
+
+    local IgnoredWeapons = {
+        ["RPG"] = true,
+        ["Parabolic Hydra"] = true,
+        ["Grenade Launcher"] = true,
+        ["Shockwave Device"] = true,
+        ["Intraplanar Device"] = true,
+        ["Rocket Stormer"] = true
+    }
+
+    -- Enemies to exclude from hitbox expansion
+    local ExcludedEnemies = {
+        ["APU"] = true,
+        ["Jetpacker"] = true
+    }
+
+    local Enabled = false
+    local HitboxEnabled = false
+    local PdcEnabled = false
+    local InfiniteJetpackEnabled = false
+    local InfiniteTvEnabled = false
+    local MedicHitboxEnabled = false
+    local EspEnabled = false
+
+    local NearSize = 2  
+    local MiddleSize = 10  
+    local FarSize = 20  
+    local NearDistance = 20  
+    local FarDistance = 170  
+
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer
+    local RunService = game:GetService("RunService")
+    local Workspace = game:GetService("Workspace")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+    local CharacterConnections = {}
+    local BackpackConnections = {}
+    local PdcConnections = {}
+    local MeterConnections = {}
+    local espCache = {}
+
+    local UnitsFolder = ReplicatedStorage:WaitForChild("Units", 5) and ReplicatedStorage.Units:WaitForChild("Noobs", 5)
+    local enemyNames = UnitsFolder and UnitsFolder:GetChildren() or {}
+
+    -- Helper function to find the closest PDC or Governor to the local player
+    local function GetNearestPDC()
+        local char = LocalPlayer.Character
+        if not char then return nil end
+        
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if not root then return nil end
+
+        local nearestTarget = nil
+        local shortestDistance = math.huge
+
+        for _, v in ipairs(Workspace:GetChildren()) do
+            if v:IsA("Model") and (v.Name == "PDC" or v.Name == "Governor") then
+                local targetRoot = v:FindFirstChild("HumanoidRootPart") or v.PrimaryPart or v:FindFirstChildWhichIsA("BasePart")
+                if targetRoot then
+                    local dist = (targetRoot.Position - root.Position).Magnitude
+                    if dist < shortestDistance then
+                        shortestDistance = dist
+                        nearestTarget = v
+                    end
+                end
+            end
+        end
+
+        return nearestTarget
+    end
+
+    -- Trigger instant refill on the closest PDC/Governor
+    local function RefillNearestPDC()
+        local char = LocalPlayer.Character
+        if not char then return end
+
+        local ammoBox = char:FindFirstChild("Ammo Box") or char:FindFirstChild("PROXY") or char:FindFirstChild("Combat Toolkit")
+        if not ammoBox then
+            local backpack = LocalPlayer:FindFirstChild("Backpack")
+            ammoBox = backpack and (backpack:FindFirstChild("Ammo Box") or backpack:FindFirstChild("PROXY") or backpack:FindFirstChild("Combat Toolkit"))
+        end
+
+        local refillEvent = ammoBox and ammoBox:FindFirstChild("Refill")
+        if not refillEvent then return end
+
+        local target = GetNearestPDC()
+        if target then
+            refillEvent:FireServer(target)
+        end
+    end
+
+    local function ModifyPdc(character)
+        for _, conn in ipairs(PdcConnections) do conn:Disconnect() end
+        PdcConnections = {}
+
+        if not PdcEnabled or not character then return end
+
+        local pdcItem = character:FindFirstChild("PDC kit")
+        if pdcItem then
+            pdcItem:SetAttribute("Charges", 999)
+            pdcItem:SetAttribute("MaxCharges", 999)
+            pdcItem:SetAttribute("Cooldown", 0.1)
+
+            local chargesConn = pdcItem:GetAttributeChangedSignal("Charges"):Connect(function()
+                if PdcEnabled and pdcItem:IsDescendantOf(character) then
+                    pdcItem:SetAttribute("Charges", 999)
+                end
+            end)
+
+            table.insert(PdcConnections, chargesConn)
+        end
+    end
+
+    local function ModifyEquipment(tool)
+        local isJetpack = (tool.Name == "Jetpack" or tool.Name == "Aerorig")
+        local isTv = (tool.Name == "Terminal velocity" or tool.Name == "Terminal Velocity")
+
+        local shouldModify = (isJetpack and InfiniteJetpackEnabled) or (isTv and InfiniteTvEnabled)
+        if not shouldModify then return end
+
+        local meterInstance = tool:FindFirstChild("Meter")
+        
+        local function lockMeter(obj)
+            if not obj:IsA("ValueBase") then return end
+            local maxIntValue = 2^62
+            obj.Value = maxIntValue
+            
+            local conn = obj:GetPropertyChangedSignal("Value"):Connect(function()
+                local active = (isJetpack and InfiniteJetpackEnabled) or (isTv and InfiniteTvEnabled)
+                if active and (obj:IsDescendantOf(LocalPlayer) or (LocalPlayer.Character and obj:IsDescendantOf(LocalPlayer.Character))) then
+                    obj.Value = maxIntValue
+                end
+            end)
+            table.insert(MeterConnections, conn)
+        end
+
+        if meterInstance then lockMeter(meterInstance) end
+
+        local childConn = tool.ChildAdded:Connect(function(child)
+            if child.Name == "Meter" then task.defer(lockMeter, child) end
+        end)
+        table.insert(MeterConnections, childConn)
+    end
+
+    local function RefreshCurrentWeapon()
+        if not Enabled or not LocalPlayer.Character then return end
+        for _, child in ipairs(LocalPlayer.Character:GetChildren()) do
+            if child:IsA("Tool") and not IgnoredWeapons[child.Name] then
+                child:SetAttribute("Ammo", 999)
+                child:SetAttribute("Firerate", WeaponSettings.Firerate)
+                child:SetAttribute("BulletSpeed", WeaponSettings.BulletSpeed)
+                child:SetAttribute("Spread", WeaponSettings.Spread)
+            end
+        end
+    end
+
+    local function ModifyTool(tool)
+        if not tool:IsA("Tool") or IgnoredWeapons[tool.Name] then return end
+        
+        if Enabled then
+            tool:SetAttribute("Ammo", 999) 
+            tool:SetAttribute("Firerate", WeaponSettings.Firerate)
+            tool:SetAttribute("BulletSpeed", WeaponSettings.BulletSpeed)
+            tool:SetAttribute("Spread", WeaponSettings.Spread)
+
+            local connection
+            connection = tool:GetAttributeChangedSignal("Ammo"):Connect(function()
+                if Enabled and tool:IsDescendantOf(LocalPlayer.Character) then
+                    tool:SetAttribute("Ammo", 999) 
+                else
+                    connection:Disconnect()
+                end
+            end)
+        end
+    end
+
+    local function WatchContainer(container, connectionTable)
+        for _, child in ipairs(container:GetChildren()) do
+            ModifyTool(child)
+            ModifyEquipment(child)
+        end
+
+        local conn = container.ChildAdded:Connect(function(child)
+            task.defer(function()
+                ModifyTool(child)
+                ModifyEquipment(child)
+                if child.Name == "PDC kit" and container == LocalPlayer.Character then
+                    ModifyPdc(LocalPlayer.Character)
+                end
+            end)
+        end)
+        table.insert(connectionTable, conn)
+    end
+
+    local function SetupCharacterAutoload(Character)
+        for _, conn in ipairs(CharacterConnections) do conn:Disconnect() end
+        for _, conn in ipairs(BackpackConnections) do conn:Disconnect() end
+        for _, conn in ipairs(MeterConnections) do conn:Disconnect() end
+        CharacterConnections, BackpackConnections, MeterConnections = {}, {}, {}
+
+        local backpack = LocalPlayer:WaitForChild("Backpack", 5)
+        if backpack then
+            WatchContainer(backpack, BackpackConnections)
+        end
+        WatchContainer(Character, CharacterConnections)
+        ModifyPdc(Character)
+    end
+
+    if LocalPlayer.Character then SetupCharacterAutoload(LocalPlayer.Character) end
+    LocalPlayer.CharacterAdded:Connect(SetupCharacterAutoload)
+
+    -- --- [ HITBOX & VISUAL ENGINES ] ---
+    local function PutOnExtend(instance)
+        if not HitboxEnabled or not instance or ExcludedEnemies[instance.Name] or not instance:FindFirstChild("Head") then return end
+        for _, x in ipairs(enemyNames) do
+            if tostring(x) == instance.Name then
+                local size = HitboxSettings.EnemySize
+                instance.Head.Transparency = 0.6
+                instance.Head.Size = Vector3.new(size, size, size)
+                instance.Head.Massless = true
+                instance.Head.CanCollide = true 
+                break
+            end
+        end
+    end
+
+    local function RemoveHitboxExtensions()
+        for _, v in ipairs(Workspace:GetChildren()) do
+            if v:FindFirstChild("Head") then
+                for _, x in ipairs(enemyNames) do
+                    if tostring(x) == v.Name then
+                        v.Head.Transparency = 0
+                        v.Head.Size = Vector3.new(1.2, 1.2, 1.2)
+                        v.Head.Massless = false
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    local function UpdateAllActiveHitboxes()
+        if not HitboxEnabled then return end
+        for _, v in ipairs(Workspace:GetChildren()) do PutOnExtend(v) end
+    end
+
+    Workspace.ChildAdded:Connect(function(v)
+        task.wait()
+        if HitboxEnabled then PutOnExtend(v) end
+    end)
+
+    RunService.Stepped:Connect(function()
+        if not HitboxEnabled then return end
+        for _, v in ipairs(Workspace:GetChildren()) do
+            if not ExcludedEnemies[v.Name] and v:FindFirstChild("Head") then
+                for _, x in ipairs(enemyNames) do
+                    if tostring(x) == v.Name then
+                        v.Head.CanCollide = false
+                        break
+                    end
+                end
+            end
+        end
+    end)
+
+    local function ResetAllPlayerHitboxes()
+        for _, v in ipairs(Players:GetPlayers()) do
+            if v ~= LocalPlayer and v.Character then
+                local rootPart = v.Character:FindFirstChild("HumanoidRootPart")
+                if rootPart then
+                    pcall(function()
+                        rootPart.Size = Vector3.new(2, 2, 2)
+                        rootPart.Transparency = 1 
+                        rootPart.BrickColor = BrickColor.new("Medium stone grey")
+                        rootPart.CanCollide = true
+                    end)
+                end
+            end
+        end
+    end
+
+    task.spawn(function()
+        while true do
+            if MedicHitboxEnabled then
+                local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if myRoot then
+                    for _, v in ipairs(Players:GetPlayers()) do
+                        if v ~= LocalPlayer and v.Character then
+                            local rootPart = v.Character:FindFirstChild("HumanoidRootPart")
+                            if rootPart then
+                                local distance = (rootPart.Position - myRoot.Position).Magnitude
+                                pcall(function()
+                                    if distance <= NearDistance then
+                                        rootPart.Size = Vector3.new(NearSize, NearSize, NearSize)
+                                        rootPart.Transparency = 0.9  
+                                        rootPart.BrickColor = BrickColor.new("Bright blue")  
+                                    elseif distance >= FarDistance then
+                                        rootPart.Size = Vector3.new(FarSize, FarSize, FarSize)
+                                        rootPart.Transparency = 0.6  
+                                        rootPart.BrickColor = BrickColor.new("Lavender")  
+                                        rootPart.CanCollide = false
+                                    else
+                                        rootPart.Size = Vector3.new(MiddleSize, MiddleSize, MiddleSize)
+                                        rootPart.Transparency = 0.7  
+                                        rootPart.BrickColor = BrickColor.new("Lavender")
+                                        rootPart.CanCollide = false
+                                    end
+                                end)
+                            end
+                        end
+                    end
+                end
+            end
+            task.wait(1)
+        end
+    end)
+
+    local function createESP(model)
+        if not EspEnabled or espCache[model] or model.Name == LocalPlayer.Name or Players:FindFirstChild(model.Name) then return end
+        local highlight = Instance.new("Highlight")
+        highlight.Name = "ESP_Highlight"
+        highlight.FillColor = Color3.fromRGB(0, 255, 0)
+        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+        highlight.FillTransparency = 0.5
+        highlight.OutlineTransparency = 0
+        highlight.Adornee = model
+        highlight.Parent = model
+        espCache[model] = highlight
+    end
+
+    local function clearAllESP()
+        for model, highlight in pairs(espCache) do
+            if highlight and highlight.Parent then highlight:Destroy() end
+        end
+        table.clear(espCache)
+    end
+
+    local function cleanDeadUnits()
+        for model, highlight in pairs(espCache) do
+            if not model.Parent or not model:FindFirstChild("Humanoid") then
+                if highlight and highlight.Parent then highlight:Destroy() end
+                espCache[model] = nil
+            end
+        end
+    end
+
+    RunService.Heartbeat:Connect(function()
+        if not EspEnabled then
+            if next(espCache) ~= nil then clearAllESP() end
+            return
+        end
+        for _, entity in ipairs(Workspace:GetChildren()) do
+            if entity:IsA("Model") and entity:FindFirstChild("Humanoid") and entity:FindFirstChild("HumanoidRootPart") then
+                createESP(entity)
+            end
+        end
+        cleanDeadUnits()
+    end)
+
+    -- --- [ UI REGISTRATION ] ---
+    MainTab.newToggle("Super Weapons", "Overpowers firerate and ammunition limits", false, function(Value)
+        Enabled = Value
+        if LocalPlayer.Character then SetupCharacterAutoload(LocalPlayer.Character) end
+    end)
+
+    MainTab.newToggle("More PDCS", "Provides custom charge counts to PDC equipment", false, function(Value)
+        PdcEnabled = Value
+        if LocalPlayer.Character and Value then ModifyPdc(LocalPlayer.Character) end
+    end)
+
+    MainTab.newButton("Refill Nearest PDC / Governor", "Fires refill remote to the closest active PDC or Governor", function()
+        RefillNearestPDC()
+    end)
+
+    MainTab.newToggle("Infinite Jetpack Meter", "Locks Jetpack meter instance to max integer", false, function(Value)
+        InfiniteJetpackEnabled = Value
+        if LocalPlayer.Character then SetupCharacterAutoload(LocalPlayer.Character) end
+    end)
+
+    MainTab.newToggle("Infinite Terminal Velocity", "Locks Terminal Velocity meter instance to max integer", false, function(Value)
+        InfiniteTvEnabled = Value
+        if LocalPlayer.Character then SetupCharacterAutoload(LocalPlayer.Character) end
+    end)
+
+    MainTab.newLabel("--- Community ---")
+    MainTab.newInput("Discord Server Invite", "https://discord.gg/4pvNcKnewr", function(Text) end)
+
+    StatsTab.newLabel("Type weapon stats using text prompts:")
+
+    StatsTab.newInput("Custom Firerate", "Default value is 99999", function(Text)
+        local num = tonumber(Text)
+        if num then WeaponSettings.Firerate = num RefreshCurrentWeapon() end
+    end)
+
+    StatsTab.newInput("Custom Bullet Speed", "Default value is 9999", function(Text)
+        local num = tonumber(Text)
+        if num then WeaponSettings.BulletSpeed = num RefreshCurrentWeapon() end
+    end)
+
+    StatsTab.newInput("Custom Spread", "Default value is 0", function(Text)
+        local num = tonumber(Text)
+        if num then WeaponSettings.Spread = num RefreshCurrentWeapon() end
+    end)
+
+    CombatTab.newToggle("Enemy Hitbox Extension", "Extends head hitboxes dynamically", false, function(Value)
+        HitboxEnabled = Value
+        if Value then UpdateAllActiveHitboxes() else RemoveHitboxExtensions() end
+    end)
+
+    CombatTab.newInput("Custom Enemy Hitbox Size", "Default size boundary is 50", function(Text)
+        local num = tonumber(Text)
+        if num then HitboxSettings.EnemySize = num UpdateAllActiveHitboxes() end
+    end)
+
+    CombatTab.newToggle("Medic Hitbox (Players)", "Extends relative teammate targets", false, function(Value)
+        MedicHitboxEnabled = Value
+        if not Value then ResetAllPlayerHitboxes() end
+    end)
+
+    CombatTab.newToggle("Highlight Visual ESP", "Renders highlights across level threats", false, function(Value)
+        EspEnabled = Value
+        if not Value then clearAllESP() end
+    end)
+
+    loadstring(game:HttpGet("https://panel.atlasteam.live/sdk/default.lua"))()
+end)
