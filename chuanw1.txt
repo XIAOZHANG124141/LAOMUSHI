@@ -1,0 +1,669 @@
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 60)
+
+local function log(tag, msg)
+    print(string.format("[Farm][%s] %s", tag, tostring(msg)))
+end
+
+-- 防掉线
+pcall(function()
+    LocalPlayer.Idled:Connect(function()
+        pcall(function()
+            game:GetService("VirtualUser"):Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+            task.wait(1)
+            game:GetService("VirtualUser"):Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+        end)
+    end)
+end)
+
+_G.test = false
+_G.ship = nil
+statusLabel = nil
+local LOAD_PORT = "Rockfall Port"
+
+-- ============================================================
+-- 基础工具
+-- ============================================================
+local function getShip()
+    if LocalPlayer:FindFirstChild("CurrentShip") and LocalPlayer.CurrentShip.Value then
+        local s = LocalPlayer.CurrentShip.Value
+        if s and s.Parent then _G.ship = s return end
+    end
+    local f = workspace:FindFirstChild("SpawnedShips")
+    if f then
+        for _, v in pairs(f:GetChildren()) do
+            if v:FindFirstChild("Storage") and v.Storage:FindFirstChild("Owner")
+               and tostring(v.Storage.Owner.Value) == tostring(LocalPlayer.Name) then
+                _G.ship = v return
+            end
+        end
+    end
+end
+
+local function sitInShip()
+    if not _G.ship or not LocalPlayer.Character then return end
+    local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    local seat = _G.ship:FindFirstChild("ControlPanel")
+                 and _G.ship.ControlPanel:FindFirstChild("VehicleSeat")
+    if seat and hum and not hum.SeatPart then
+        seat:Sit(hum)
+        task.wait(1)
+    end
+end
+
+local function setThrottle(speed)
+    pcall(function()
+        if _G.ship and _G.ship:FindFirstChild("Storage") then
+            _G.ship.Storage.RemoteEvent:FireServer("SetThrottle", speed)
+        end
+    end)
+end
+
+local function stopShip()
+    setThrottle(0)
+    pcall(function()
+        if _G.ship then
+            for _, p in pairs(_G.ship:GetChildren()) do
+                if p:IsA("BasePart") then
+                    p.AssemblyLinearVelocity = Vector3.new(0,0,0)
+                    p.AssemblyAngularVelocity = Vector3.new(0,0,0)
+                end
+            end
+        end
+    end)
+end
+
+local function setSteer(v)
+    pcall(function()
+        _G.ship.ControlPanel.VehicleSeat.SteerFloat = v
+    end)
+end
+
+-- ★ 侧推方向：想左转用 "Right"，想右转用 "Left"
+local thrusterActive = nil
+local function setThruster(side)
+    if thrusterActive == side then return end
+    if thrusterActive then
+        pcall(function()
+            _G.ship.Storage.RemoteEvent:FireServer("DockingTrusters", thrusterActive, false)
+        end)
+    end
+    thrusterActive = side
+    if side then
+        pcall(function()
+            _G.ship.Storage.RemoteEvent:FireServer("DockingTrusters", side, true)
+        end)
+    end
+end
+
+local function getAngle(target)
+    if not _G.ship or not _G.ship.PrimaryPart then return 0 end
+    local pos = _G.ship.PrimaryPart.Position
+    local look = _G.ship.PrimaryPart.CFrame.LookVector
+    local dir = (Vector3.new(target.X, pos.Y, target.Z) - pos)
+    if dir.Magnitude < 1 then return 0 end
+    dir = dir.Unit
+    return math.deg(math.atan2(look:Cross(dir).Y, look:Dot(dir)))
+end
+
+local function getRemote()
+    if not _G.ship then return nil end
+    local s = _G.ship:FindFirstChild("Storage")
+    return s and s:FindFirstChild("RemoteFunction")
+end
+
+-- ============================================================
+-- 港口 / DockingArea
+-- ============================================================
+local function getDockingArea(portName)
+    for _, port in pairs(workspace.Ports:GetChildren()) do
+        if port.Name == portName then
+            local cl = port:FindFirstChild("CargoLoaders")
+            if cl then
+                for _, c in pairs(cl:GetChildren()) do
+                    if c.Name == "DockingArea" then return c end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ★ 用船底最低点检测（不是 Base）
+local function isInsideDock(dockArea)
+    if not _G.ship or not dockArea then return false end
+    local lowest, lowestY = nil, math.huge
+    for _, p in pairs(_G.ship:GetDescendants()) do
+        if p:IsA("BasePart") and p.Position.Y < lowestY then
+            lowestY = p.Position.Y
+            lowest = p
+        end
+    end
+    if not lowest then return false end
+    local ok, res = pcall(function()
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {_G.ship}
+        params.MaxParts = 1
+        for _, part in pairs(workspace:GetPartsInPart(lowest, params)) do
+            if part == dockArea then return true end
+        end
+        return false
+    end)
+    return ok and res or false
+end
+
+-- ============================================================
+-- UI 工具
+-- ============================================================
+local function fireButton(btn)
+    if not btn then return false end
+    local ok = pcall(function()
+        if getconnections then
+            for _, c in pairs(getconnections(btn.MouseButton1Click)) do
+                if c.Function then pcall(c.Function) end
+            end
+        else
+            btn.MouseButton1Click:Fire()
+        end
+    end)
+    return ok
+end
+
+local function waitChild(parent, name, t)
+    t = t or 10
+    local s = tick()
+    while tick() - s < t do
+        local c = parent:FindFirstChild(name)
+        if c then return c end
+        task.wait(0.1)
+    end
+    return nil
+end
+
+local function waitPortGui(t)
+    t = t or 30
+    local s = tick()
+    while tick() - s < t do
+        local g = LocalPlayer.PlayerGui:FindFirstChild("PortGui")
+        if g and g.Enabled then return g end
+        task.wait(0.3)
+    end
+    return nil
+end
+
+local function waitLoadingBar()
+    local s = tick()
+    while tick() - s < 90 do
+        local g = LocalPlayer.PlayerGui:FindFirstChild("PortGui")
+        if g then
+            local lb = g:FindFirstChild("LoadingBar")
+            if not lb or not lb.Visible then return true end
+        end
+        task.wait(0.3)
+    end
+    return false
+end
+
+-- ============================================================
+-- ★ 航行 + 泊靠（修复1 + 修复2）
+-- ============================================================
+local function sailAndDock(portName)
+    if not _G.ship or not _G.ship.PrimaryPart then return false end
+    local dockArea = getDockingArea(portName)
+    if not dockArea then
+        log("SAIL", "找不到 " .. portName .. " 的 DockingArea")
+        return false
+    end
+    local target = dockArea.Position
+    log("SAIL", "目标: " .. portName)
+    if statusLabel then statusLabel.Text = "航行至 " .. portName end
+
+    setThruster(nil)
+    local startT = os.clock()
+    local lastLog = 0
+
+    while _G.test and (os.clock() - startT) < 400 do
+        if not _G.ship or not _G.ship.PrimaryPart then return false end
+
+        -- ★ 进入黄色区域就停
+        if isInsideDock(dockArea) then
+            log("SAIL", "★ 进入 DockingArea!")
+            setThrottle(0)
+            setThruster(nil)
+            setSteer(0)
+            break
+        end
+
+        local pos = _G.ship.PrimaryPart.Position
+        local dist = (Vector3.new(target.X, pos.Y, target.Z) - pos).Magnitude
+
+        local thr = 23
+        if dist > 5000 then thr = 23
+        elseif dist > 2000 then thr = 18
+        elseif dist > 500 then thr = 12
+        elseif dist > 150 then thr = 6
+        elseif dist > 50 then thr = 3
+        else thr = 2 end
+
+        -- ★ 转向：大角度倒车 + 满舵 + 侧推
+        local angle = getAngle(target)
+        local aa = math.abs(angle)
+
+        if aa > 30 then
+            -- 倒车掉头
+            setThrottle(-3)
+            if angle > 0 then
+                setSteer(-1)
+                setThruster("Right")   -- ★ 想左转用 Right
+            else
+                setSteer(1)
+                setThruster("Left")    -- ★ 想右转用 Left
+            end
+            task.wait(0.3)
+            setThrottle(0)
+            task.wait(0.15)
+        elseif aa > 15 then
+            setThrottle(3)
+            if angle > 0 then setSteer(-1) setThruster("Right")
+            else setSteer(1) setThruster("Left") end
+        elseif aa > 5 then
+            setThrottle(5)
+            if angle > 0 then setSteer(-1) setThruster("Right")
+            else setSteer(1) setThruster("Left") end
+        else
+            setSteer(0)
+            setThruster(nil)
+            setThrottle(thr)
+        end
+
+        if os.clock() - lastLog > 5 then
+            local speed = _G.ship.Base and _G.ship.Base.AssemblyLinearVelocity.Magnitude or 0
+            log("SAIL", string.format("距离%.0f 速度%.1f 角度%.1f°", dist, speed, angle))
+            lastLog = os.clock()
+        end
+        task.wait(0.1)
+    end
+
+    setThruster(nil)
+    setSteer(0)
+    for i = 1, 20 do
+        if not _G.ship or not _G.ship.Base then break end
+        if _G.ship.Base.AssemblyLinearVelocity.Magnitude < 0.5 then break end
+        stopShip()
+        task.wait(0.2)
+    end
+    stopShip()
+    task.wait(2)
+
+    -- ===== 泊靠 =====
+    log("DOCK", "等待 DockingRequest...")
+    local rf = getRemote()
+    for attempt = 1, 20 do
+        if not _G.test then return false end
+        local g = LocalPlayer.PlayerGui:FindFirstChild("PortGui")
+        if g and g.Enabled then
+            log("DOCK", "★ 泊靠成功")
+            return true
+        end
+        -- 点 Dock 按钮
+        local scg = LocalPlayer.PlayerGui:FindFirstChild("ShipControlGui")
+        if scg and scg:FindFirstChild("Menus") then
+            local dr = scg.Menus:FindFirstChild("DockingRequest")
+            if dr and dr.Visible then
+                for _, btn in pairs(dr:GetDescendants()) do
+                    if btn:IsA("TextButton") and btn.Name == "Dock" then
+                        fireButton(btn)
+                        log("DOCK", "点击 Dock")
+                        break
+                    end
+                end
+                task.wait(3)
+                if waitPortGui(5) then
+                    log("DOCK", "★ 泊靠成功")
+                    return true
+                end
+            end
+        end
+        if attempt % 4 == 0 and rf then
+            pcall(function() rf:InvokeServer("DockShip") end)
+        end
+        task.wait(0.5)
+    end
+    log("DOCK", "泊靠超时")
+    return false
+end
+
+local function undock()
+    pcall(function()
+        _G.ship.Storage.RemoteEvent:FireServer("Undock")
+    end)
+    task.wait(2)
+end
+
+-- ============================================================
+-- ★ 装货（修复3 + 修复4：读 Origin + 等 LoadingBar）
+-- ============================================================
+local function loadCargo()
+    local rf = getRemote()
+    if not rf then return false, nil end
+    if not waitPortGui(10) then
+        log("CARGO", "PortGui 不存在")
+        return false, nil
+    end
+    task.wait(1)
+
+    local okB, bulk = pcall(function() return rf:InvokeServer("GetLoadingCargo", "Bulk") end)
+    task.wait(0.4)
+    local okC, cont = pcall(function() return rf:InvokeServer("GetLoadingCargo", "Container") end)
+    task.wait(0.4)
+
+    local shipPos = _G.ship.PrimaryPart.Position
+    local bestType, bestKey, bestIdx, bestAmt, bestDest = nil, -1, nil, nil, nil
+
+    local function scan(list, typeName)
+        if not list or type(list) ~= "table" then return end
+        for i, c in pairs(list) do
+            -- ★ 读 Origin 字段（游戏源码里就是这个名字）
+            local dest = c.Origin or c.Port
+            if dest and type(dest) == "string" then
+                local da = getDockingArea(dest)
+                local dist = 0
+                if da then
+                    dist = (da.Position - shipPos).Magnitude / 4777
+                end
+                local val = c.Value or c.Payout or 0
+                local score = val * (dist + 0.5)
+                if score > bestKey then
+                    bestKey = score
+                    bestType = typeName
+                    bestIdx = i
+                    bestAmt = c.Holds or tostring(c.Count or 1)
+                    bestDest = dest
+                end
+            end
+        end
+    end
+    scan(bulk, "Bulk")
+    scan(cont, "Container")
+
+    if not bestType or not bestDest then
+        log("CARGO", "没有可装货物")
+        return false, nil
+    end
+
+    log("CARGO", string.format("★ 装 %s 去 %s (得分 %.0f)", bestType, bestDest, bestKey))
+
+    if bestType == "Bulk" then
+        pcall(function() rf:InvokeServer("LoadBulk", bestIdx, bestAmt) end)
+    else
+        pcall(function() rf:InvokeServer("LoadContainer", bestIdx, bestAmt) end)
+    end
+    waitLoadingBar()
+    task.wait(2)
+
+    -- 继续装满同目的地的货
+    for _ = 1, 5 do
+        if not _G.test then break end
+        local ok, list = pcall(function() return rf:InvokeServer("GetLoadingCargo", bestType) end)
+        task.wait(0.4)
+        if not ok or not list then break end
+        local found = false
+        for i, c in pairs(list) do
+            local dest = c.Origin or c.Port
+            if dest == bestDest and (c.Value or c.Payout or 0) > 0 then
+                if bestType == "Bulk" then
+                    pcall(function() rf:InvokeServer("LoadBulk", i, c.Holds or 1) end)
+                else
+                    pcall(function() rf:InvokeServer("LoadContainer", i, tostring(c.Count or 1)) end)
+                end
+                found = true
+                waitLoadingBar()
+                task.wait(2)
+                break
+            end
+        end
+        if not found then break end
+    end
+
+    log("CARGO", "装货完成 → " .. bestDest)
+    return true, bestDest
+end
+
+-- ============================================================
+-- 卸货
+-- ============================================================
+local function unloadCargo()
+    local rf = getRemote()
+    if not rf then return end
+    if not waitPortGui(10) then return end
+    task.wait(1)
+
+    local ok, data = pcall(function() return rf:InvokeServer("GetLoads") end)
+    task.wait(0.4)
+    if not ok or not data then return end
+
+    local bulk = data.Bulk and data.Bulk.Loads
+    if bulk then
+        for i, _ in ipairs(bulk) do
+            if not _G.test then break end
+            pcall(function() rf:InvokeServer("UnloadBulk", i) end)
+            log("CARGO", "卸 Bulk #" .. i)
+            waitLoadingBar()
+            task.wait(2)
+        end
+    end
+    local cont = data.Container and data.Container.Loads
+    if cont then
+        for i, _ in ipairs(cont) do
+            if not _G.test then break end
+            pcall(function() rf:InvokeServer("UnloadContainer", i) end)
+            log("CARGO", "卸 Container #" .. i)
+            waitLoadingBar()
+            task.wait(2)
+        end
+    end
+    log("CARGO", "卸货完成")
+end
+
+-- ============================================================
+-- 加油
+-- ============================================================
+local function refuel()
+    local rf = getRemote()
+    if not rf then return end
+    local fuel = _G.ship:GetAttribute("ShipFuel") or 0
+    local maxF = _G.ship:GetAttribute("ShipFuelMax") or 1000
+    local need = maxF - fuel
+    if need > 0 then
+        pcall(function() rf:InvokeServer("RefuelShip", math.floor(need)) end)
+        task.wait(1)
+        log("CARGO", "加油 +" .. math.floor(need))
+    end
+end
+
+-- ============================================================
+-- 主循环
+-- ============================================================
+local function runFarm()
+    task.spawn(function()
+        log("FARM", "===== 启动 =====")
+        task.wait(2)
+        getShip()
+        if not _G.ship then
+            repeat task.wait(1) getShip() until _G.ship or not _G.test
+        end
+        if not _G.ship then log("FARM", "找不到船") return end
+        sitInShip()
+        repeat task.wait(0.5) until
+            (LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+             and LocalPlayer.Character.Humanoid.SeatPart) or not _G.test
+        task.wait(3)
+
+        local cycle = 0
+        while _G.test do
+            cycle = cycle + 1
+            log("FARM", "===== 第 " .. cycle .. " 轮 =====")
+
+            if not _G.ship or not _G.ship.Parent then
+                _G.ship = nil
+                repeat task.wait(1) getShip() until _G.ship or not _G.test
+                sitInShip()
+                task.wait(3)
+            end
+            if not _G.test then break end
+
+            pcall(function()
+                -- 1. 去装货港
+                if statusLabel then statusLabel.Text = "前往 " .. LOAD_PORT end
+                if not sailAndDock(LOAD_PORT) then
+                    undock()
+                    task.wait(5)
+                    return
+                end
+
+                -- 2. 装货（读 Origin）
+                if statusLabel then statusLabel.Text = "装货中..." end
+                local ok, dest = loadCargo()
+                if not ok or not dest then
+                    log("FARM", "装货失败")
+                    undock()
+                    task.wait(10)
+                    return
+                end
+
+                -- 3. 加油
+                if statusLabel then statusLabel.Text = "加油中..." end
+                refuel()
+
+                -- 4. 离港
+                undock()
+                task.wait(5)
+                if not _G.ship or not _G.ship.Parent then return end
+
+                -- 5. 去货物目的地
+                log("FARM", "★ 目的地: " .. dest)
+                if statusLabel then statusLabel.Text = "前往 " .. dest end
+                if not sailAndDock(dest) then
+                    undock()
+                    task.wait(5)
+                    return
+                end
+
+                -- 6. 卸货
+                if statusLabel then statusLabel.Text = "卸货中..." end
+                unloadCargo()
+
+                -- 7. 离港
+                undock()
+                task.wait(5)
+
+                if statusLabel then statusLabel.Text = "第 " .. cycle .. " 轮完成" end
+                log("FARM", "===== 第 " .. cycle .. " 轮完成 =====")
+            end)
+        end
+        log("FARM", "===== 结束 =====")
+    end)
+end
+
+-- ============================================================
+-- UI
+-- ============================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "ShippingFarm"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = PlayerGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 220, 0, 130)
+frame.Position = UDim2.new(0, 20, 0.5, -65)
+frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+Instance.new("UIStroke", frame).Color = Color3.fromRGB(80,80,80)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -20, 0, 24)
+title.Position = UDim2.new(0, 10, 0, 6)
+title.BackgroundTransparency = 1
+title.Text = "Shipping Lanes [修复版]"
+title.TextColor3 = Color3.fromRGB(255,255,255)
+title.TextSize = 14
+title.Font = Enum.Font.GothamBold
+title.Parent = frame
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -20, 0, 18)
+statusLabel.Position = UDim2.new(0, 10, 0, 32)
+statusLabel.BackgroundColor3 = Color3.fromRGB(40,40,45)
+statusLabel.Text = "待机"
+statusLabel.TextColor3 = Color3.fromRGB(200,200,200)
+statusLabel.TextSize = 11
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.Parent = frame
+Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0, 6)
+
+local route = Instance.new("TextLabel")
+route.Size = UDim2.new(1, -20, 0, 16)
+route.Position = UDim2.new(0, 10, 0, 52)
+route.BackgroundTransparency = 1
+route.Text = "装货: Rockfall → 卸货: 自动(Origin)"
+route.TextColor3 = Color3.fromRGB(150,200,255)
+route.TextSize = 10
+route.Font = Enum.Font.Gotham
+route.Parent = frame
+
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.new(1, -20, 0, 28)
+btn.Position = UDim2.new(0, 10, 0, 74)
+btn.BackgroundColor3 = Color3.fromRGB(60,60,65)
+btn.Text = "Auto Farm: OFF"
+btn.TextColor3 = Color3.fromRGB(255,255,255)
+btn.TextSize = 13
+btn.Font = Enum.Font.GothamBold
+btn.Parent = frame
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+btn.MouseButton1Click:Connect(function()
+    _G.test = not _G.test
+    if _G.test then
+        btn.Text = "Auto Farm: ON"
+        btn.BackgroundColor3 = Color3.fromRGB(0,140,60)
+        statusLabel.Text = "启动中..."
+        runFarm()
+    else
+        btn.Text = "Auto Farm: OFF"
+        btn.BackgroundColor3 = Color3.fromRGB(60,60,65)
+        statusLabel.Text = "待机"
+        setThrottle(0)
+        setThruster(nil)
+        setSteer(0)
+    end
+end)
+
+local close = Instance.new("TextButton")
+close.Size = UDim2.new(0, 20, 0, 20)
+close.Position = UDim2.new(1, -26, 0, 4)
+close.BackgroundColor3 = Color3.fromRGB(180,40,40)
+close.Text = "X"
+close.TextColor3 = Color3.fromRGB(255,255,255)
+close.TextSize = 10
+close.Font = Enum.Font.GothamBold
+close.Parent = frame
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 6)
+
+close.MouseButton1Click:Connect(function()
+    _G.test = false
+    setThrottle(0)
+    setThruster(nil)
+    setSteer(0)
+    gui:Destroy()
+end)
+
+log("INIT", "加载完成，点击 Auto Farm 启动")
